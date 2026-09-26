@@ -8,6 +8,7 @@ let fragmentStale = false; // 原提示单发生增删改后，旧预览失效
 let deferPlan = null; // 当前顺延预演结果
 let deferStale = false; // 提示单发生增删改后，旧预演失效（确认时服务端也会再核对版本）
 let rehearsal = null; // 当前排练视图（GET /api/rehearsal 的 rehearsal；null 表示无进行中排练）
+let rehEdit = null; // 进行中的登记时间勘误：{ cueId, field: 'actualStart'|'actualEnd', value, justOpened }
 
 const $ = (sel) => document.querySelector(sel);
 const el = (tag, cls, text) => {
@@ -890,6 +891,84 @@ const REH_STATUS = {
   done: { cls: 'ok', text: '已完成' },
 };
 
+// 实际开始/结束单元格：已登记的值旁提供「改」进入勘误；未登记（—）不能借此补录
+function rehActualCell(it, field) {
+  const td = el('td', 'num');
+  const val = it[field];
+  if (val === null) {
+    td.textContent = '—';
+    return td;
+  }
+
+  if (rehEdit && rehEdit.cueId === it.cueId && rehEdit.field === field) {
+    const wrap = el('span', 'reh-edit');
+    const input = el('input', 'reh-edit-input');
+    input.type = 'number';
+    input.min = '0';
+    input.step = '0.1';
+    input.value = rehEdit.value;
+    input.addEventListener('input', () => { rehEdit.value = input.value; });
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); submitRehCorrection(); }
+      else if (ev.key === 'Escape') { rehEdit = null; renderRehearsal(); }
+    });
+    const okBtn = el('button', 'btn small primary', '✓');
+    okBtn.type = 'button';
+    okBtn.title = '确认勘误（服务端将基于冻结提示与全部当前记录整体校验）';
+    okBtn.addEventListener('click', () => submitRehCorrection());
+    const noBtn = el('button', 'btn small ghost', '✗');
+    noBtn.type = 'button';
+    noBtn.title = '取消勘误';
+    noBtn.addEventListener('click', () => { rehEdit = null; renderRehearsal(); });
+    wrap.append(input, okBtn, noBtn);
+    td.append(wrap);
+    return td;
+  }
+
+  td.append(el('span', null, fmtNum(val)));
+  td.append(document.createTextNode(' '));
+  const btn = el('button', 'btn small ghost reh-edit-btn', '改');
+  btn.type = 'button';
+  btn.title = `勘误：把已登记的实际${field === 'actualStart' ? '开始' : '结束'}秒数改为另一个非负秒数`;
+  btn.addEventListener('click', () => {
+    rehEdit = { cueId: it.cueId, field, value: String(val), justOpened: true };
+    renderRehearsal();
+  });
+  td.append(btn);
+  return td;
+}
+
+async function submitRehCorrection() {
+  if (!rehEdit) return;
+  const raw = String(rehEdit.value).trim();
+  const n = Number(raw);
+  if (raw === '' || !Number.isFinite(n) || n < 0) {
+    showRehError(['勘误秒数必须是非负数字']);
+    return;
+  }
+  const { cueId, field } = rehEdit;
+  try {
+    const data = await api('POST', '/api/rehearsal/records/correct', {
+      cueId,
+      field: field === 'actualStart' ? 'start' : 'end',
+      value: n,
+    });
+    rehearsal = data.rehearsal;
+    rehEdit = null;
+    hideRehError();
+    renderRehearsal();
+    showBanner('勘误已保存，排练视图已刷新（冻结计划与原提示单不变）', 'ok');
+  } catch (err) {
+    // 服务端权威校验拒绝：列出涉及提示与原因，并拉取最新排练视图（保留勘误编辑框便于改后重试）
+    showRehError(err.errors || [err.message]);
+    try {
+      const fresh = await api('GET', '/api/rehearsal');
+      rehearsal = fresh.rehearsal;
+      renderRehearsal();
+    } catch (_) { /* 忽略刷新失败 */ }
+  }
+}
+
 function deltaCell(d) {
   const td = el('td', 'num');
   if (d === null || d === undefined) {
@@ -917,6 +996,12 @@ function deltaCell(d) {
 function renderRehearsal() {
   const idle = $('#rehIdle');
   const active = $('#rehActive');
+  // 勘误目标已失效（排练重置 / 字段不再处于已登记状态）时退出勘误编辑
+  if (rehEdit) {
+    const rec = rehearsal && rehearsal.records ? rehearsal.records[rehEdit.cueId] : null;
+    const cur = rec ? rec[rehEdit.field] : null;
+    if (!rehearsal || cur === null || cur === undefined) rehEdit = null;
+  }
   if (!rehearsal) {
     idle.hidden = false;
     active.hidden = true;
@@ -944,8 +1029,8 @@ function renderRehearsal() {
     tr.append(el('td', null, it.channel));
     tr.append(el('td', 'num', fmtNum(it.plannedStart)));
     tr.append(el('td', 'num', fmtNum(it.plannedEnd)));
-    tr.append(el('td', 'num', it.actualStart === null ? '—' : fmtNum(it.actualStart)));
-    tr.append(el('td', 'num', it.actualEnd === null ? '—' : fmtNum(it.actualEnd)));
+    tr.append(rehActualCell(it, 'actualStart'));
+    tr.append(rehActualCell(it, 'actualEnd'));
     tr.append(deltaCell(it.startDelta));
     tr.append(deltaCell(it.endDelta));
 
@@ -979,6 +1064,13 @@ function renderRehearsal() {
     tr.append(actTd);
     tbody.append(tr);
   });
+
+  // 刚打开勘误编辑框时聚焦（其余重渲染不抢占焦点，例如正在填写演出秒数）
+  if (rehEdit && rehEdit.justOpened) {
+    rehEdit.justOpened = false;
+    const input = tbody.querySelector('.reh-edit-input');
+    if (input) { input.focus(); input.select(); }
+  }
 }
 
 async function startRehearsal() {

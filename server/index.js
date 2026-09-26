@@ -7,7 +7,7 @@ const { JsonStore, RehearsalStore } = require('./store');
 const { evaluate, validateCueBody, round } = require('./scheduler');
 const { buildFragment } = require('./fragment');
 const { cuesVersion, planDeferral } = require('./defer');
-const { createRehearsal, checkStart, checkEnd, rehearsalView } = require('./rehearsal');
+const { createRehearsal, checkStart, checkEnd, correctRecord, rehearsalView } = require('./rehearsal');
 
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, '..', 'data', 'cues.json');
@@ -279,6 +279,45 @@ function rehearsalRecordHandler(kind) {
 
 app.post('/api/rehearsal/records/start', rehearsalRecordHandler('start'));
 app.post('/api/rehearsal/records/end', rehearsalRecordHandler('end'));
+
+// 登记时间勘误：把已登记的实际开始/结束秒数改为另一个非负秒数。
+// 服务端基于本次冻结提示与全部当前记录整体重校验，任一记录失效则整次拒绝。
+app.post('/api/rehearsal/records/correct', (req, res) => {
+  const rehearsal = rehearsalStore.rehearsal;
+  if (!rehearsal) {
+    return fail(res, 409, '当前没有进行中的排练，请先「开始排练」', { code: 'no_active' });
+  }
+
+  const body = req.body || {};
+  const cueId = typeof body.cueId === 'string' ? body.cueId.trim() : '';
+  if (!cueId) return fail(res, 400, '缺少要勘误的提示 cueId');
+
+  const fieldMap = { start: 'actualStart', end: 'actualEnd' };
+  const field = fieldMap[body.field];
+  if (!field) {
+    return fail(res, 400, '勘误字段 field 必须是 start（实际开始）或 end（实际结束）');
+  }
+
+  const value = parseShowSecond(body.value);
+  if (value.error) return fail(res, 400, `勘误秒数无效：${value.error}`);
+
+  let check;
+  try {
+    check = correctRecord(rehearsal, cueId, field, value.value);
+  } catch (e) {
+    return fail(res, e.status || 400, e.message, { errors: e.errors || [e.message] });
+  }
+  if (!check.ok) {
+    return fail(res, 409, '勘误会使登记记录失效，已拒绝整次修改', {
+      code: 'correction_invalid',
+      errors: check.reasons,
+      reasons: check.reasons,
+    });
+  }
+
+  rehearsalStore.persist(); // 原子写入（临时文件 + rename），冻结计划与原提示单不变
+  res.json({ ok: true, rehearsal: rehearsalView(rehearsal) });
+});
 
 app.post('/api/rehearsal/reset', (req, res) => {
   // 只清空排练记录，不修改原提示单

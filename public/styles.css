@@ -289,3 +289,14 @@ tr.row-running { background: rgba(242,169,59,.06); }
 tr.row-done td { color: #cfcadb; }
 .btn[disabled] { opacity: .5; cursor: not-allowed; }
 .reh-legend { margin-top: 10px; }
+
+/* 登记时间勘误 */
+.reh-edit { display: inline-flex; align-items: center; gap: 4px; }
+.reh-edit-input {
+  width: 86px;
+  padding: 3px 6px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.reh-edit-btn { padding: 1px 7px; font-size: 11px; margin-left: 4px; }
+.reh-edit .btn.small { padding: 2px 8px; }

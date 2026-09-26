@@ -10,6 +10,8 @@
  *   2) 本通道没有进行中（已开始、未结束）的提示；
  *   3) 演出秒数不早于本通道最后一次实际结束（首尾相接可用）。
  * - 登记「结束」：仅进行中的提示可登记，且结束秒数不得早于实际开始。
+ * - 勘误：已登记的实际开始/结束秒数可改为另一个非负秒数（未登记字段不能借此补录或清空）；
+ *   提交时基于冻结提示与全部当前记录整体重校验，任一记录失效则整次拒绝。
  * - 重置：清空本次排练记录，可开启新一轮；不修改原提示单。
  */
 
@@ -155,6 +157,131 @@ function checkEnd(rehearsal, cueId, at) {
 }
 
 /**
+ * 以本次冻结提示为基准，整体校验一组登记记录（勘误提交时使用）。
+ * 返回失效原因列表（空数组 = 全部有效），每条原因都点名涉及的提示。
+ * 规则：
+ *  1) 已登记结束的记录：实际结束不得早于其实际开始；
+ *  2) 已登记开始的记录：固定提示不早于固定开始秒数；相对提示的前置必须已登记实际结束，
+ *     且不早于 前置实际结束 + 延迟秒数；
+ *  3) 同通道已开始的实际区间 [开始, 结束) 互不重叠；进行中（未登记结束）视为开放区间
+ *     [开始, +∞)；首尾相接（前一条结束 = 后一条开始）允许。
+ */
+function validateRecords(rehearsal, records) {
+  const reasons = [];
+  const byId = new Map(rehearsal.cues.map((c) => [c.id, c]));
+  const nameOf = (id) => {
+    const c = byId.get(id);
+    return c ? `「${c.name}」` : `（${id}）`;
+  };
+  const recOf = (id) => {
+    const r = records[id];
+    if (!r) return { actualStart: null, actualEnd: null };
+    return {
+      actualStart: r.actualStart === undefined ? null : r.actualStart,
+      actualEnd: r.actualEnd === undefined ? null : r.actualEnd,
+    };
+  };
+
+  // 规则 1 / 2：逐条校验（按冻结提示单顺序，保证输出稳定）
+  for (const cue of rehearsal.cues) {
+    const rec = recOf(cue.id);
+    if (rec.actualStart === null) continue;
+
+    if (cue.startType === 'after') {
+      const predRec = recOf(cue.afterCueId);
+      if (predRec.actualEnd === null) {
+        reasons.push(
+          `${nameOf(cue.id)}已登记实际开始，但前置提示${nameOf(cue.afterCueId)}尚未登记实际结束`
+        );
+      } else {
+        const earliest = round(predRec.actualEnd + cue.delayAfter);
+        if (rec.actualStart < earliest - EPS) {
+          reasons.push(
+            `${nameOf(cue.id)}实际开始 ${rec.actualStart}s 早于前置${nameOf(cue.afterCueId)}` +
+              `实际结束 +${round(cue.delayAfter)}s 延迟（最早可于 ${earliest}s 开始）`
+          );
+        }
+      }
+    } else if (rec.actualStart < cue.fixedAt - EPS) {
+      reasons.push(
+        `${nameOf(cue.id)}实际开始 ${rec.actualStart}s 早于固定开始秒数（第 ${round(cue.fixedAt)}s）`
+      );
+    }
+
+    if (rec.actualEnd !== null && rec.actualEnd < rec.actualStart - EPS) {
+      reasons.push(`${nameOf(cue.id)}实际结束 ${rec.actualEnd}s 早于其实际开始 ${rec.actualStart}s`);
+    }
+  }
+
+  // 规则 3：同通道已开始区间互不重叠（进行中 = 开放区间，首尾相接允许）
+  const byChannel = new Map();
+  for (const cue of rehearsal.cues) {
+    const rec = recOf(cue.id);
+    if (rec.actualStart === null) continue;
+    if (!byChannel.has(cue.channel)) byChannel.set(cue.channel, []);
+    byChannel.get(cue.channel).push({
+      id: cue.id,
+      start: rec.actualStart,
+      end: rec.actualEnd === null ? Infinity : rec.actualEnd,
+    });
+  }
+  const fmtEnd = (v) => (v === Infinity ? '进行中' : `${v}s`);
+  for (const channel of [...byChannel.keys()].sort()) {
+    const items = byChannel.get(channel).sort((a, b) => a.start - b.start || a.end - b.end);
+    for (let i = 0; i < items.length; i++) {
+      for (let j = i + 1; j < items.length; j++) {
+        const a = items[i];
+        const b = items[j];
+        // 左闭右开重叠：max(start) < min(end)；进行中 end = +∞
+        if (Math.max(a.start, b.start) < Math.min(a.end, b.end) - EPS) {
+          reasons.push(
+            `通道「${channel}」上${nameOf(a.id)}（${a.start}s – ${fmtEnd(a.end)}）与` +
+              `${nameOf(b.id)}（${b.start}s – ${fmtEnd(b.end)}）的实际区间重叠`
+          );
+        }
+      }
+    }
+  }
+
+  return reasons;
+}
+
+/**
+ * 登记时间勘误：把已登记的实际开始/结束秒数（field 为 actualStart / actualEnd）
+ * 改为另一个非负秒数 value。未登记的字段不能借此补录（接口只接受非负秒数，也无法清空）。
+ * 改动先应用到全部当前记录的副本上，基于冻结提示整体重校验；
+ * 任一记录失效则整次拒绝（原记录不变），通过才把副本写回 rehearsal.records。
+ * 提示不在冻结提示单中抛 404；字段未登记抛 409。返回 { ok, reasons }。
+ */
+function correctRecord(rehearsal, cueId, field, value) {
+  findCue(rehearsal, cueId);
+  const label = field === 'actualStart' ? '实际开始' : '实际结束';
+  const current = recOf(rehearsal, cueId);
+  if (current[field] === null) {
+    throw httpError(
+      409,
+      `该提示的${label}尚未登记，勘误不能补录未登记字段（也不能清空已登记字段），请先正常登记`,
+      [`该提示的${label}尚未登记，不能通过勘误补录`]
+    );
+  }
+
+  // 在全部当前记录的副本上应用本次改动
+  const next = {};
+  for (const id of Object.keys(rehearsal.records)) {
+    const r = recOf(rehearsal, id);
+    next[id] = { actualStart: r.actualStart, actualEnd: r.actualEnd };
+  }
+  if (!next[cueId]) next[cueId] = { actualStart: null, actualEnd: null };
+  next[cueId][field] = value;
+
+  const reasons = validateRecords(rehearsal, next);
+  if (reasons.length) return { ok: false, reasons };
+
+  rehearsal.records = next; // 校验通过，整体写回（调用方负责原子持久化）
+  return { ok: true, reasons: [] };
+}
+
+/**
  * 排练视图：冻结计划 + 逐条状态（未开始 / 进行中 / 已完成）与计划-实际偏差，按计划开始时间排序。
  */
 function rehearsalView(rehearsal) {
@@ -202,4 +329,4 @@ function rehearsalView(rehearsal) {
   };
 }
 
-module.exports = { createRehearsal, checkStart, checkEnd, rehearsalView };
+module.exports = { createRehearsal, checkStart, checkEnd, correctRecord, validateRecords, rehearsalView };
