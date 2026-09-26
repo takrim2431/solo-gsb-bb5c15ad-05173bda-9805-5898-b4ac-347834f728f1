@@ -8,6 +8,7 @@ let fragmentStale = false; // 原提示单发生增删改后，旧预览失效
 let deferPlan = null; // 当前顺延预演结果
 let deferStale = false; // 提示单发生增删改后，旧预演失效（确认时服务端也会再核对版本）
 let rehearsal = null; // 当前排练视图（GET /api/rehearsal 的 rehearsal；null 表示无进行中排练）
+let rehEditing = null; // 勘误中的单元格 { cueId, field: 'start'|'end', draft }；null 表示未在勘误
 
 const $ = (sel) => document.querySelector(sel);
 const el = (tag, cls, text) => {
@@ -914,10 +915,68 @@ function deltaCell(d) {
   return td;
 }
 
+// 实际开始/结束单元格：已登记的值可点击 ✏️ 勘误为非负秒数；未登记显示 —（不能借此补录）
+function rehActualCell(it, field) {
+  const td = el('td', 'num');
+  const value = field === 'start' ? it.actualStart : it.actualEnd;
+  if (value === null) {
+    td.textContent = '—';
+    return td;
+  }
+
+  if (rehEditing && rehEditing.cueId === it.cueId && rehEditing.field === field) {
+    const input = el('input', 'reh-edit-input');
+    input.type = 'number';
+    input.min = '0';
+    input.step = '0.1';
+    input.value = rehEditing.draft;
+    const okBtn = el('button', 'btn small primary', '✓');
+    okBtn.type = 'button';
+    okBtn.title = '确认勘误（服务端将基于冻结提示单与全部当前记录重新校验）';
+    const cancelBtn = el('button', 'btn small ghost', '✕');
+    cancelBtn.type = 'button';
+    cancelBtn.title = '取消勘误';
+    const submit = () => correctRehearsalRecord(it.cueId, field, input.value);
+    okBtn.addEventListener('click', submit);
+    // 时钟输入等触发的重渲染会重建本输入框，实时同步草稿避免丢失已输入内容
+    input.addEventListener('input', () => {
+      if (rehEditing) rehEditing.draft = input.value;
+    });
+    cancelBtn.addEventListener('click', () => {
+      rehEditing = null;
+      renderRehearsal();
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        submit();
+      } else if (e.key === 'Escape') {
+        rehEditing = null;
+        renderRehearsal();
+      }
+    });
+    td.append(input, okBtn, cancelBtn);
+    setTimeout(() => input.focus(), 0);
+    return td;
+  }
+
+  td.append(el('span', null, fmtNum(value)));
+  const editBtn = el('button', 'btn small ghost reh-edit-btn', '✏️');
+  editBtn.type = 'button';
+  editBtn.title = `勘误实际${field === 'start' ? '开始' : '结束'}秒数（仅已登记字段可改，不能补录或清空）`;
+  editBtn.addEventListener('click', () => {
+    rehEditing = { cueId: it.cueId, field, draft: fmtNum(value) };
+    renderRehearsal();
+  });
+  td.append(editBtn);
+  return td;
+}
+
 function renderRehearsal() {
   const idle = $('#rehIdle');
   const active = $('#rehActive');
   if (!rehearsal) {
+    rehEditing = null;
     idle.hidden = false;
     active.hidden = true;
     return;
@@ -944,8 +1003,8 @@ function renderRehearsal() {
     tr.append(el('td', null, it.channel));
     tr.append(el('td', 'num', fmtNum(it.plannedStart)));
     tr.append(el('td', 'num', fmtNum(it.plannedEnd)));
-    tr.append(el('td', 'num', it.actualStart === null ? '—' : fmtNum(it.actualStart)));
-    tr.append(el('td', 'num', it.actualEnd === null ? '—' : fmtNum(it.actualEnd)));
+    tr.append(rehActualCell(it, 'start'));
+    tr.append(rehActualCell(it, 'end'));
     tr.append(deltaCell(it.startDelta));
     tr.append(deltaCell(it.endDelta));
 
@@ -987,6 +1046,7 @@ async function startRehearsal() {
   try {
     const data = await api('POST', '/api/rehearsal/start');
     rehearsal = data.rehearsal;
+    rehEditing = null;
     hideRehError();
     renderRehearsal();
     showBanner('已开始排练：当前提示单与重算计划已冻结', 'ok');
@@ -1006,6 +1066,7 @@ async function rehearsalRecord(kind, cueId) {
   try {
     const data = await api('POST', `/api/rehearsal/records/${kind}`, { cueId, at });
     rehearsal = data.rehearsal;
+    rehEditing = null; // 记录已变化，进行中的勘误草稿作废
     hideRehError();
     renderRehearsal();
     showBanner(kind === 'start' ? '已登记实际开始' : '已登记实际结束', 'ok');
@@ -1020,11 +1081,40 @@ async function rehearsalRecord(kind, cueId) {
   }
 }
 
+// 提交勘误：已登记的实际开始/结束改为非负秒数；服务端基于冻结提示单与全部当前记录整体重校验
+async function correctRehearsalRecord(cueId, field, rawValue) {
+  const n = String(rawValue).trim() === '' ? NaN : Number(rawValue);
+  if (!Number.isFinite(n) || n < 0) {
+    rehEditing = { cueId, field, draft: String(rawValue) };
+    showRehError(['勘误秒数必须是非负数字：已登记字段不能清空，也不能改为负数']);
+    renderRehearsal();
+    return;
+  }
+  try {
+    const data = await api('POST', '/api/rehearsal/records/correct', { cueId, field, value: n });
+    rehearsal = data.rehearsal;
+    rehEditing = null;
+    hideRehError();
+    renderRehearsal();
+    showBanner('已勘误登记时间，排练视图已刷新', 'ok');
+  } catch (err) {
+    // 保留输入草稿便于修改后重试；同时拉取最新排练视图（记录可能已被他处改变）
+    rehEditing = { cueId, field, draft: String(rawValue) };
+    showRehError(err.errors || [err.message]);
+    try {
+      const fresh = await api('GET', '/api/rehearsal');
+      rehearsal = fresh.rehearsal;
+    } catch (_) { /* 忽略刷新失败 */ }
+    renderRehearsal();
+  }
+}
+
 async function resetRehearsal() {
   if (!confirm('确定重置本次排练？\n将清除全部实际登记记录并允许开启新一轮排练（原提示单不受影响）。')) return;
   try {
     await api('POST', '/api/rehearsal/reset');
     rehearsal = null;
+    rehEditing = null;
     hideRehError();
     renderRehearsal();
     showBanner('已重置，可开始新一轮排练', 'ok');

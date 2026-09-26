@@ -289,3 +289,5 @@ tr.row-running { background: rgba(242,169,59,.06); }
 tr.row-done td { color: #cfcadb; }
 .btn[disabled] { opacity: .5; cursor: not-allowed; }
 .reh-legend { margin-top: 10px; }
+.reh-edit-btn { padding: 1px 6px; margin-left: 6px; font-size: 11px; }
+.reh-edit-input { width: 90px; padding: 4px 6px; font-size: 13px; margin-right: 4px; }

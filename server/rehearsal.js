@@ -10,6 +10,8 @@
  *   2) 本通道没有进行中（已开始、未结束）的提示；
  *   3) 演出秒数不早于本通道最后一次实际结束（首尾相接可用）。
  * - 登记「结束」：仅进行中的提示可登记，且结束秒数不得早于实际开始。
+ * - 登记时间勘误：已登记的实际开始/结束可改为非负秒数（未登记字段不能借此补录或清空）；
+ *   提交时基于冻结提示单与全部当前记录整体重校验，任一记录失效则整次拒绝。
  * - 重置：清空本次排练记录，可开启新一轮；不修改原提示单。
  */
 
@@ -155,6 +157,114 @@ function checkEnd(rehearsal, cueId, at) {
 }
 
 /**
+ * 全量校验一组登记记录（勘误提交时的整体重校验）。
+ * recordsMap: { [cueId]: { actualStart, actualEnd } }，基于冻结提示单逐条检查：
+ *   1) 已登记结束不早于其实际开始（有结束却无开始同样失效）；
+ *   2) 已登记开始满足 固定起点 / 前置实际结束 + 延迟；
+ *   3) 同通道已开始区间互不重叠（进行中视为开放区间 [start, +∞)，首尾相接允许）。
+ * 返回问题列表（空数组 = 全部有效），每条都给出涉及的提示与原因。
+ */
+function validateRecords(rehearsal, recordsMap) {
+  const problems = [];
+  const get = (id) => recordsMap[id] || { actualStart: null, actualEnd: null };
+  const nameOf = (id) => {
+    const c = rehearsal.cues.find((x) => x.id === id);
+    return c ? `「${c.name}」` : `（${id}）`;
+  };
+
+  // 1) 结束不早于开始
+  for (const c of rehearsal.cues) {
+    const r = get(c.id);
+    if (r.actualEnd === null) continue;
+    if (r.actualStart === null) {
+      problems.push(`${nameOf(c.id)}已登记实际结束（${r.actualEnd}s）但未登记实际开始`);
+    } else if (r.actualEnd < r.actualStart - EPS) {
+      problems.push(`${nameOf(c.id)}实际结束（${r.actualEnd}s）早于其实际开始（${r.actualStart}s）`);
+    }
+  }
+
+  // 2) 开始满足固定起点 / 前置实际结束 + 延迟
+  for (const c of rehearsal.cues) {
+    const r = get(c.id);
+    if (r.actualStart === null) continue;
+    if (c.startType === 'after') {
+      const predRec = get(c.afterCueId);
+      if (predRec.actualEnd === null) {
+        problems.push(`${nameOf(c.id)}已登记实际开始，但前置${nameOf(c.afterCueId)}尚未登记实际结束`);
+      } else {
+        const earliest = round(predRec.actualEnd + c.delayAfter);
+        if (r.actualStart < earliest - EPS) {
+          problems.push(
+            `${nameOf(c.id)}实际开始（${r.actualStart}s）早于前置${nameOf(c.afterCueId)}实际结束 ` +
+              `+${round(c.delayAfter)}s 延迟（最早可于 ${earliest}s 开始）`
+          );
+        }
+      }
+    } else if (r.actualStart < c.fixedAt - EPS) {
+      problems.push(`${nameOf(c.id)}实际开始（${r.actualStart}s）早于固定开始秒数（第 ${round(c.fixedAt)}s）`);
+    }
+  }
+
+  // 3) 同通道已开始区间互不重叠（进行中视为开放区间，首尾相接允许）
+  const byChannel = new Map();
+  for (const c of rehearsal.cues) {
+    const r = get(c.id);
+    if (r.actualStart === null) continue;
+    if (!byChannel.has(c.channel)) byChannel.set(c.channel, []);
+    byChannel.get(c.channel).push({ cue: c, start: r.actualStart, end: r.actualEnd });
+  }
+  for (const [channel, items] of byChannel) {
+    items.sort(
+      (a, b) =>
+        a.start - b.start ||
+        (a.end === null ? Infinity : a.end) - (b.end === null ? Infinity : b.end)
+    );
+    for (let i = 0; i < items.length; i++) {
+      for (let j = i + 1; j < items.length; j++) {
+        const a = items[i];
+        const b = items[j];
+        const aEnd = a.end === null ? Infinity : a.end;
+        const bEnd = b.end === null ? Infinity : b.end;
+        // 左闭右开重叠：max(start) < min(end)；进行中（end 为 null）视为开放到 +∞
+        if (Math.max(a.start, b.start) < Math.min(aEnd, bEnd) - EPS) {
+          const fmt = (x) =>
+            x.end === null
+              ? `${nameOf(x.cue.id)}（进行中，自 ${x.start}s 起）`
+              : `${nameOf(x.cue.id)}（${x.start}s–${x.end}s）`;
+          problems.push(`通道「${channel}」上${fmt(a)}与${fmt(b)}的实际区间重叠`);
+        }
+      }
+    }
+  }
+
+  return problems;
+}
+
+/**
+ * 登记时间勘误校验：把 cueId 已登记的实际开始/结束（field: 'start'|'end'）改为 value 秒。
+ * 未登记字段不能借此补录（也不能清空——value 必须是非负秒数，由调用方保证）。
+ * 基于冻结提示单与全部当前记录（含本次改动）整体重校验；
+ * 提示不在本次排练中抛 404；返回 { ok, reasons }，ok 时由调用方应用改动并原子持久化。
+ */
+function checkCorrection(rehearsal, cueId, field, value) {
+  const cue = findCue(rehearsal, cueId);
+  const key = field === 'start' ? 'actualStart' : 'actualEnd';
+  const label = field === 'start' ? '实际开始' : '实际结束';
+
+  if (recOf(rehearsal, cueId)[key] === null) {
+    return { ok: false, reasons: [`「${cue.name}」尚未登记${label}，勘误不能补录未登记字段`] };
+  }
+
+  // 候选记录 = 全部当前记录 + 本次改动，整体重校验
+  const candidate = {};
+  for (const c of rehearsal.cues) candidate[c.id] = recOf(rehearsal, c.id);
+  candidate[cueId] = { ...candidate[cueId], [key]: value };
+
+  const problems = validateRecords(rehearsal, candidate);
+  return { ok: problems.length === 0, reasons: problems };
+}
+
+/**
  * 排练视图：冻结计划 + 逐条状态（未开始 / 进行中 / 已完成）与计划-实际偏差，按计划开始时间排序。
  */
 function rehearsalView(rehearsal) {
@@ -202,4 +312,4 @@ function rehearsalView(rehearsal) {
   };
 }
 
-module.exports = { createRehearsal, checkStart, checkEnd, rehearsalView };
+module.exports = { createRehearsal, checkStart, checkEnd, checkCorrection, validateRecords, rehearsalView };
