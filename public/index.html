@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>演出提示单 · 小剧场排练</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <h1>🎭 演出提示单 <span class="sub">小剧场排练用</span></h1>
+      <p class="hint">区间按<strong>左闭右开 [开始, 结束)</strong>绘制；同一独占通道时间重叠会标红冲突，首尾相接不算冲突。冲突允许保留，供排练现场调整。</p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <div id="banner" class="banner hidden"></div>
+
+    <section class="panel" id="rehearsalPanel">
+      <div class="panel-head">
+        <h2>🎬 实况排练台（单次排练）</h2>
+      </div>
+      <div id="rehError" class="banner err hidden"></div>
+
+      <div id="rehIdle">
+        <p class="hint">
+          点击「开始排练」将<strong>冻结当前提示单与重算计划</strong>作为本次排练基准；排练中按演出秒数逐条登记实际开始 / 结束，
+          记录自动持久化，刷新页面可继续。排练期间修改提示单<strong>不影响</strong>已冻结的排练；
+          「重置排练」清空登记记录后可开启新一轮，原提示单不变。
+        </p>
+        <div class="form-actions reh-start-actions">
+          <button type="button" class="btn primary" id="rehStartBtn">▶ 开始排练</button>
+        </div>
+      </div>
+
+      <div id="rehActive" hidden>
+        <div class="reh-bar">
+          <label class="reh-clock">当前演出秒数
+            <input type="number" id="rehClock" min="0" step="0.1" value="0" />
+          </label>
+          <button type="button" class="btn danger" id="rehResetBtn">↺ 重置排练（开启新一轮）</button>
+        </div>
+        <div class="frag-meta ok" id="rehMeta"></div>
+        <div class="table-wrap">
+          <table id="rehTable">
+            <thead>
+              <tr>
+                <th>#</th><th>名称</th><th>独占通道</th>
+                <th>计划开始(s)</th><th>计划结束(s)</th>
+                <th>实际开始(s)</th><th>实际结束(s)</th>
+                <th>开始偏差</th><th>结束偏差</th>
+                <th>状态</th><th>操作 / 阻止原因</th>
+              </tr>
+            </thead>
+            <tbody id="rehTbody"></tbody>
+          </table>
+        </div>
+        <p class="hint reh-legend">
+          登记「开始」需同时满足：前置提示已实际结束且达到其实际结束 + 延迟（固定提示达到固定秒数）、本通道无进行中提示、
+          不早于本通道最后一次实际结束；登记「结束」的秒数不得早于其实际开始。偏差为实际 − 计划（+ 表示晚了，− 表示早了）。
+        </p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2 id="timelineTitle">时间轴（按通道）</h2>
+        <div class="legend">
+          <span class="lg lg-ok"></span> 正常
+          <span class="lg lg-bad"></span> 冲突时段
+          <span class="lg lg-unknown"></span> 时间未定（引用/环问题）
+        </div>
+      </div>
+      <div id="timeline"></div>
+    </section>
+
+    <section class="panel" id="conflictPanel" hidden>
+      <h2>⚠️ 通道冲突（可保留，仅作排练提醒）</h2>
+      <ul id="conflictList" class="conflict-list"></ul>
+    </section>
+
+    <section class="panel" id="deferPanel" hidden>
+      <h2>⏭️ 冲突顺延预演（确认前不会写入）</h2>
+      <p class="hint">
+        在不提前原开始时刻的前提下，为该提示在其通道上搜索<strong>最早完整空位</strong>（遇占用推到占用结束，首尾相接可用）；
+        固定开始提示改固定秒数，相对开始提示只增加延迟秒数；其后继提示随调度器重算，不作为搜索障碍。
+      </p>
+      <div id="deferError" class="banner err hidden"></div>
+      <div id="deferResult" hidden>
+        <div class="frag-meta ok" id="deferMeta"></div>
+
+        <h3 class="frag-h3">被顺延的提示（前后时刻）</h3>
+        <div class="table-wrap">
+          <table id="deferTable">
+            <thead>
+              <tr>
+                <th>名称</th><th>独占通道</th><th>原开始(s)</th><th>原结束(s)</th><th>新开始(s)</th><th>新结束(s)</th><th>说明</th>
+              </tr>
+            </thead>
+            <tbody id="deferTbody"></tbody>
+          </table>
+        </div>
+
+        <div class="defer-diff">
+          <section class="frag-subpanel" id="deferAddedPanel" hidden>
+            <h3 class="frag-h3">🔺 顺延新增的冲突</h3>
+            <ul id="deferAddedList" class="conflict-list"></ul>
+          </section>
+          <section class="frag-subpanel" id="deferRemovedPanel" hidden>
+            <h3 class="frag-h3">✅ 顺延消失的冲突</h3>
+            <ul id="deferRemovedList" class="conflict-list"></ul>
+          </section>
+        </div>
+
+        <div class="form-actions">
+          <button type="button" class="btn primary" id="deferConfirmBtn">确认顺延并保存</button>
+          <button type="button" class="btn ghost" id="deferCancelBtn">取消预演</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="fragmentPanel">
+      <h2>✂️ 片段排练单（按原演出时间窗截取）</h2>
+      <p class="hint">
+        输入原演出时间窗 <strong>[起, 止)</strong>（左闭右开，秒），可在页面预览片段时间轴与通道冲突，并下载一份
+        <strong>独立可用</strong>的 JSON 提示单（时间已平移到从 0 开始）。原提示单不会被修改。
+        前置未入选或提示跨左边界时，该提示会改为<strong>固定开始</strong>，保证下载文件无悬空引用。
+      </p>
+      <form id="fragmentForm" class="frag-form">
+        <div class="frag-inputs">
+          <label>窗口起点（秒，含）
+            <input type="number" id="fr-start" min="0" step="0.1" value="30" required />
+          </label>
+          <label>窗口止点（秒，不含）
+            <input type="number" id="fr-end" min="0" step="0.1" value="70" required />
+          </label>
+          <div class="frag-actions">
+            <button type="submit" class="btn primary" id="frPreviewBtn">生成预览</button>
+            <button type="button" class="btn" id="frDownloadBtn" disabled>下载片段 JSON</button>
+          </div>
+        </div>
+      </form>
+      <div id="fragError" class="banner err hidden"></div>
+      <div id="fragResult" class="frag-result" hidden>
+        <div class="frag-meta" id="fragMeta"></div>
+
+        <h3 class="frag-h3">片段时间轴（时间已平移到 0）</h3>
+        <div id="fragTimeline"></div>
+
+        <section class="frag-subpanel" id="fragConflictPanel" hidden>
+          <h3 class="frag-h3">⚠️ 片段通道冲突（左闭右开）</h3>
+          <ul id="fragConflictList" class="conflict-list"></ul>
+        </section>
+
+        <h3 class="frag-h3">片段提示列表</h3>
+        <div class="table-wrap">
+          <table id="fragTable">
+            <thead>
+              <tr>
+                <th>#</th><th>名称</th><th>独占通道</th><th>持续(s)</th><th>开始方式</th><th>开始(s)</th><th>结束(s)</th><th>原区间(s)</th><th>说明</th>
+              </tr>
+            </thead>
+            <tbody id="fragTbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 id="formTitle">➕ 新增提示</h2>
+      <form id="cueForm" class="cue-form">
+        <input type="hidden" id="f-id" />
+        <div class="grid">
+          <label>名称
+            <input type="text" id="f-name" maxlength="80" placeholder="例如：第一幕追光" required />
+          </label>
+          <label>独占设备通道
+            <input type="text" id="f-channel" maxlength="40" placeholder="例如：灯光台 A / 调音台 M" required />
+          </label>
+          <label>持续秒数
+            <input type="number" id="f-duration" min="0" step="0.1" placeholder="秒" required />
+          </label>
+        </div>
+
+        <fieldset class="start-box">
+          <legend>开始时间</legend>
+          <div class="seg">
+            <label><input type="radio" name="startType" value="fixed" checked /> 固定演出秒数</label>
+            <label><input type="radio" name="startType" value="after" /> 另一提示结束后</label>
+          </div>
+          <div id="fixedBox" class="start-detail">
+            <label>从演出开始第
+              <input type="number" id="f-fixedAt" min="0" step="0.1" value="0" /> 秒
+            </label>
+          </div>
+          <div id="afterBox" class="start-detail" hidden>
+            <label>在
+              <select id="f-afterCueId"></select>
+              结束后
+            </label>
+            <label>延迟
+              <input type="number" id="f-delayAfter" min="0" step="0.1" value="0" /> 秒开始
+            </label>
+          </div>
+        </fieldset>
+
+        <div class="form-actions">
+          <button type="submit" id="submitBtn" class="btn primary">保存新增</button>
+          <button type="button" id="cancelEdit" class="btn ghost" hidden>取消编辑</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>提示列表</h2>
+      <div class="table-wrap">
+        <table id="cueTable">
+          <thead>
+            <tr>
+              <th>#</th><th>名称</th><th>独占通道</th><th>持续(s)</th><th>开始方式</th><th>重算开始</th><th>结束(s)</th><th>状态</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="cueTbody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
